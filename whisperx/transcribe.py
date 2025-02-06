@@ -69,6 +69,8 @@ def cli():
     parser.add_argument("--condition_on_previous_text", type=str2bool, default=False, help="if True, provide the previous output of the model as a prompt for the next window; disabling may make the text inconsistent across windows, but the model becomes less prone to getting stuck in a failure loop")
     parser.add_argument("--fp16", type=str2bool, default=True, help="whether to perform inference in fp16; True by default")
 
+    parser.add_argument("--hotwords", type=str, default=None, help="hotwords/hint phrases to the model.")
+
     parser.add_argument("--temperature_increment_on_fallback", type=optional_float, default=0.2, help="temperature to increase when falling back when the decoding fails to meet either of the thresholds below")
     parser.add_argument("--compression_ratio_threshold", type=optional_float, default=2.4, help="if the gzip compression ratio is higher than this value, treat the decoding as failed")
     parser.add_argument("--logprob_threshold", type=optional_float, default=-1.0, help="if the average log probability is lower than this value, treat the decoding as failed")
@@ -136,7 +138,9 @@ def cli():
                 f"{model_name} is an English-only model but received '{args['language']}'; using English instead."
             )
         args["language"] = "en"
-    align_language = args["language"] if args["language"] is not None else "en" # default to loading english if not specified
+    align_language = (
+        args["language"] if args["language"] is not None else "en"
+    )  # default to loading english if not specified
 
     temperature = args.pop("temperature")
     if (increment := args.pop("temperature_increment_on_fallback")) is not None:
@@ -161,6 +165,7 @@ def cli():
         "initial_prompt": args.pop("initial_prompt"),
         "suppress_tokens": [int(x) for x in args.pop("suppress_tokens").split(",")],
         "suppress_numerals": args.pop("suppress_numerals"),
+        "hotwords": args.pop("hotwords"),
     }
 
     writer = get_writer(output_format, output_dir)
@@ -172,12 +177,28 @@ def cli():
     if args["max_line_count"] and not args["max_line_width"]:
         warnings.warn("--max_line_count has no effect without --max_line_width")
     writer_args = {arg: args.pop(arg) for arg in word_options}
-    
+
     # Part 1: VAD & ASR Loop
     results = []
     tmp_results = []
     # model = load_model(model_name, device=device, download_root=model_dir)
-    model = load_model(model_name, device=device, device_index=device_index, download_root=model_dir, compute_type=compute_type, language=args['language'], asr_options=asr_options, vad_method=vad_method, vad_options={"chunk_size":chunk_size, "vad_onset": vad_onset, "vad_offset": vad_offset}, task=task, threads=faster_whisper_threads)
+    model = load_model(
+        model_name,
+        device=device,
+        device_index=device_index,
+        download_root=model_dir,
+        compute_type=compute_type,
+        language=args["language"],
+        asr_options=asr_options,
+        vad_method=vad_method,
+        vad_options={
+            "chunk_size": chunk_size,
+            "vad_onset": vad_onset,
+            "vad_offset": vad_offset,
+        },
+        task=task,
+        threads=faster_whisper_threads,
+    )
 
     for audio_path in args.pop("audio"):
         audio = load_audio(audio_path)
@@ -201,7 +222,9 @@ def cli():
     if not no_align:
         tmp_results = results
         results = []
-        align_model, align_metadata = load_align_model(align_language, device, model_name=align_model)
+        align_model, align_metadata = load_align_model(
+            align_language, device, model_name=align_model
+        )
         for result, audio_path in tmp_results:
             # >> Align
             if len(tmp_results) > 1:
@@ -213,8 +236,12 @@ def cli():
             if align_model is not None and len(result["segments"]) > 0:
                 if result.get("language", "en") != align_metadata["language"]:
                     # load new language
-                    print(f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language...")
-                    align_model, align_metadata = load_align_model(result["language"], device)
+                    print(
+                        f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language..."
+                    )
+                    align_model, align_metadata = load_align_model(
+                        result["language"], device
+                    )
                 print(">>Performing alignment...")
                 result: AlignedTranscriptionResult = align(
                     result["segments"],
@@ -237,19 +264,24 @@ def cli():
     # >> Diarize
     if diarize:
         if hf_token is None:
-            print("Warning, no --hf_token used, needs to be saved in environment variable, otherwise will throw error loading diarization model...")
+            print(
+                "Warning, no --hf_token used, needs to be saved in environment variable, otherwise will throw error loading diarization model..."
+            )
         tmp_results = results
         print(">>Performing diarization...")
         results = []
         diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
         for result, input_audio_path in tmp_results:
-            diarize_segments = diarize_model(input_audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+            diarize_segments = diarize_model(
+                input_audio_path, min_speakers=min_speakers, max_speakers=max_speakers
+            )
             result = assign_word_speakers(diarize_segments, result)
             results.append((result, input_audio_path))
     # >> Write
     for result, audio_path in results:
         result["language"] = align_language
         writer(result, audio_path, writer_args)
+
 
 if __name__ == "__main__":
     cli()
